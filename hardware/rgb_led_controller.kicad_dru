@@ -1,0 +1,5 @@
+(version 1)
+# Nets that can reach the TVS clamp voltage (up to 73 V): IPC-2221 B2 spacing 0.6 mm
+(rule "hv_clearance"
+	(condition "A.NetName == '+24V' || A.NetName == '/VIN_RAW' || A.NetName == '/GND_IN' || A.NetName == '/Q1_BIAS' || A.NetName == '/Q5_BIAS' || A.NetName == '/LED_R' || A.NetName == '/LED_G' || A.NetName == '/LED_B' || B.NetName == '+24V' || B.NetName == '/VIN_RAW' || B.NetName == '/GND_IN' || B.NetName == '/Q1_BIAS' || B.NetName == '/Q5_BIAS' || B.NetName == '/LED_R' || B.NetName == '/LED_G' || B.NetName == '/LED_B'")
+	(constraint clearance (min 0.6mm)))

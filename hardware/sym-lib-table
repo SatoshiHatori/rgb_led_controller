@@ -1,0 +1,4 @@
+(sym_lib_table
+	(version 7)
+	(lib (name "vsi")(type "KiCad")(uri "${KIPRJMOD}/rgb_led_controller.kicad_sym")(options "")(descr "Project symbols"))
+)
