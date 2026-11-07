@@ -1,0 +1,12 @@
+# Firmware build output
+firmware/build/
+firmware/.pio/
+
+# KiCad local state, backups, caches
+hardware/.history/
+*.kicad_prl
+*-backups/
+fp-info-cache
+*.lck
+\#auto_saved_files#
+_autosave-*
