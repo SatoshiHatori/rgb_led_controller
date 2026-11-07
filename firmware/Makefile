@@ -14,8 +14,10 @@ LDFLAGS := $(ARCHFLAGS) -nostdlib -nostartfiles -Wl,--gc-sections -Wl,-T,link.ld
 all: $(BUILD)/vsi.hex
 	$(SIZE) $(BUILD)/vsi.elf
 
-$(BUILD)/vsi.elf: src/startup.S src/main.c src/color.c src/color.h link.ld | $(BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) src/startup.S src/main.c src/color.c -lgcc -o $@
+SRCS := src/startup.S src/main.c src/color.c src/dbglog.c
+
+$(BUILD)/vsi.elf: $(SRCS) src/color.h src/dbglog.h link.ld | $(BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) $(SRCS) -lgcc -o $@
 
 $(BUILD)/vsi.hex: $(BUILD)/vsi.elf
 	$(OBJCOPY) -O ihex $< $@
@@ -26,6 +28,8 @@ $(BUILD):
 test: | $(BUILD)
 	gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g src/color.c test/test_color.c -o $(BUILD)/test_color
 	$(BUILD)/test_color
+	gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g src/dbglog.c test/test_dbglog.c -o $(BUILD)/test_dbglog
+	$(BUILD)/test_dbglog
 
 clean:
 	rm -rf $(BUILD)

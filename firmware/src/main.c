@@ -6,9 +6,17 @@
  * フレーム形式は docs/adr/0005-can-color-frame.md を参照。
  *
  * レジスタのオフセットとビットは WCH EVT (ch32v20x.h, ch32v20x_can.c) と照合した。
+ *
+ * デバッグ出力: USART1 (PA9=TX、J5) に 115200bps 8N1 で状態を出す。-DDEBUG_UART=0 で無効。
+ * 出力は 1 行 1 イベントで、起動、色の変化、途絶による消灯、CAN エラー状態の変化、取りこぼし。
  */
 #include <stdint.h>
 #include "color.h"
+#include "dbglog.h"
+
+#ifndef DEBUG_UART
+#define DEBUG_UART 1
+#endif
 
 #ifndef CAN_COLOR_ID
 #define CAN_COLOR_ID 0x7D0u /* 11bit 標準 ID。番号が大きいほど低優先 (ADR-0005) */
@@ -27,6 +35,15 @@
 #define RCC_CFGR0 REG32(RCC_BASE + 0x04)
 #define RCC_APB2PCENR REG32(RCC_BASE + 0x18)
 #define RCC_APB1PCENR REG32(RCC_BASE + 0x1C)
+#define RCC_RSTSCKR REG32(RCC_BASE + 0x24)
+
+#define USART1_BASE 0x40013800u
+#define USART1_STATR REG32(USART1_BASE + 0x00)
+#define USART1_DATAR REG32(USART1_BASE + 0x04)
+#define USART1_BRR REG32(USART1_BASE + 0x08)
+#define USART1_CTLR1 REG32(USART1_BASE + 0x0C)
+#define USART_BAUD 115200u
+#define SYSCLK_HZ 8000000u
 
 #define GPIOA_BASE 0x40010800u
 #define GPIOB_BASE 0x40010C00u
@@ -57,6 +74,7 @@
 #define CAN_CTLR REG32(CAN_BASE + 0x000)
 #define CAN_STATR REG32(CAN_BASE + 0x004)
 #define CAN_RFIFO0 REG32(CAN_BASE + 0x00C)
+#define CAN_ERRSR REG32(CAN_BASE + 0x018)
 #define CAN_BTIMR REG32(CAN_BASE + 0x01C)
 #define CAN_RXMDTR0 REG32(CAN_BASE + 0x1B4)
 #define CAN_RXMDLR0 REG32(CAN_BASE + 0x1B8)
@@ -71,19 +89,21 @@
 #define CAN_INAK_TIMEOUT 0xFFFFu
 #define HSE_START_TIMEOUT 0x8000u
 
-/* 水晶が起動しない場合は内蔵 8MHz のまま動く。周波数は同じだが CAN の精度は保証されない。 */
-static void clock_init(void)
+/* 水晶が起動しない場合は内蔵 8MHz のまま動く。周波数は同じだが CAN の精度は保証されない。
+ * 水晶で動いていれば 1 を返す。 */
+static int clock_init(void)
 {
     uint32_t n = 0;
 
     RCC_CTLR |= 1u << 16; /* HSEON */
     while (!(RCC_CTLR & (1u << 17)) && n++ < HSE_START_TIMEOUT) /* HSERDY */
         ;
-    if (RCC_CTLR & (1u << 17)) {
-        RCC_CFGR0 = (RCC_CFGR0 & ~3u) | 1u; /* SW = HSE */
-        while ((RCC_CFGR0 & 0xCu) != 0x4u)
-            ;
-    }
+    if (!(RCC_CTLR & (1u << 17)))
+        return 0;
+    RCC_CFGR0 = (RCC_CFGR0 & ~3u) | 1u; /* SW = HSE */
+    while ((RCC_CFGR0 & 0xCu) != 0x4u)
+        ;
+    return 1;
 }
 
 static void gpio_init(void)
@@ -96,10 +116,11 @@ static void gpio_init(void)
     GPIO_OUTDR(GPIOA_BASE) = 0xFFF8u;
     GPIO_CFGLR(GPIOA_BASE) = 0x88888999u;
 
-    /* PA11=CAN_RX (0x8)、PA12=CAN_TX (AF PP 50MHz = 0xB)。PA13/14 はデバッグ用に変更しない。 */
+    /* PA11=CAN_RX (0x8)、PA12=CAN_TX (AF PP 50MHz = 0xB)。PA13/14 はデバッグ用に変更しない。
+     * DEBUG_UART のとき PA9=USART1_TX (AF PP 50MHz = 0xB)。PA10 (RX) はプルアップ入力のまま。 */
     cfgh = GPIO_CFGHR(GPIOA_BASE);
     cfgh &= 0x0FF00000u;
-    cfgh |= 0x800B8888u;
+    cfgh |= DEBUG_UART ? 0x800B88B8u : 0x800B8888u;
     GPIO_CFGHR(GPIOA_BASE) = cfgh;
 
     GPIO_OUTDR(GPIOB_BASE) = 0xFFFFu;
@@ -131,7 +152,24 @@ static int can_wait_inak(uint32_t expected)
     return 1;
 }
 
-static void can_init(void)
+/* 送信のみ。待たずに済むよう、メインループの uart_poll で 1 文字ずつ出す。 */
+static void uart_init(void)
+{
+    RCC_APB2PCENR |= 1u << 14; /* USART1 */
+    USART1_BRR = (SYSCLK_HZ + USART_BAUD / 2u) / USART_BAUD; /* 69: 115942bps、誤差 +0.6% */
+    USART1_CTLR1 = (1u << 13) | (1u << 3); /* UE, TE */
+}
+
+static void uart_poll(void)
+{
+    uint8_t c;
+
+    if ((USART1_STATR & (1u << 7)) && dbglog_pop(&c)) /* TXE */
+        USART1_DATAR = c;
+}
+
+/* 通常モードに入れたら 1 を返す */
+static int can_init(void)
 {
     RCC_APB1PCENR |= 1u << 25; /* CAN1 */
 
@@ -160,7 +198,7 @@ static void can_init(void)
     CAN_FCTLR &= ~1u;
 
     CAN_CTLR &= ~1u; /* 通常モードへ */
-    (void)can_wait_inak(0u);
+    return can_wait_inak(0u);
 }
 
 static void iwdg_init(void)
@@ -179,31 +217,123 @@ static void pwm_apply(const color_state_t *s)
     TIM2_CH3CVR = color_duty(s->b);
 }
 
+/* 直前のリセット要因を返してフラグを消す */
+static const char *reset_cause(void)
+{
+    uint32_t f = RCC_RSTSCKR;
+    const char *s = "?";
+
+    if (f & (1u << 29))
+        s = "iwdg";
+    else if (f & (1u << 28))
+        s = "soft";
+    else if (f & (1u << 27))
+        s = "por";
+    else if (f & (1u << 26))
+        s = "pin";
+    RCC_RSTSCKR |= 1u << 24; /* RMVF */
+    return s;
+}
+
+static void log_boot(int hse, int can_ok)
+{
+    dbglog_puts("\r\nboot rst=");
+    dbglog_puts(reset_cause());
+    dbglog_puts(hse ? " clk=hse" : " clk=hsi");
+    dbglog_puts(can_ok ? " can=ok" : " can=ng");
+    dbglog_puts(" id=");
+    dbglog_hex(CAN_COLOR_ID, 3);
+    dbglog_puts(" kbps=");
+    dbglog_dec(500u / CAN_BRP);
+    dbglog_puts(" timeout_ms=");
+    dbglog_dec(COLOR_TIMEOUT_MS);
+    dbglog_puts("\r\n");
+}
+
+static void log_color(const color_state_t *s)
+{
+    dbglog_puts("rgb ");
+    dbglog_hex(s->r, 2);
+    dbglog_hex(s->g, 2);
+    dbglog_hex(s->b, 2);
+    dbglog_puts(" hold_ms=");
+    dbglog_dec(s->hold_ms);
+    dbglog_puts("\r\n");
+}
+
+/* ERRSR の BOFF/EPVF/EWGF と LEC (直近のエラー種別) が変わったら出す */
+static void log_can_error(uint32_t *last)
+{
+    uint32_t e = CAN_ERRSR;
+    uint32_t key = e & 0x77u;
+
+    if (key == *last)
+        return;
+    *last = key;
+    dbglog_puts("can errsr=");
+    dbglog_hex(e, 8);
+    dbglog_puts((e & 4u) ? " busoff" : (e & 2u) ? " passive" : (e & 1u) ? " warn" : " ok");
+    dbglog_puts("\r\n");
+}
+
 int main(void)
 {
     color_state_t state;
+    uint32_t last_err = 0;
+    int hse, can_ok;
 
-    clock_init();
+    hse = clock_init();
     gpio_init();
     pwm_init();
-    can_init();
+    can_ok = can_init();
     iwdg_init();
     color_init(&state);
+    dbglog_init();
+    if (DEBUG_UART) {
+        uart_init();
+        log_boot(hse, can_ok);
+    }
 
     for (;;) {
         if (CAN_RFIFO0 & 3u) { /* FMP0 */
             uint32_t low = CAN_RXMDLR0;
             uint8_t data[4] = {(uint8_t)low, (uint8_t)(low >> 8), (uint8_t)(low >> 16), (uint8_t)(low >> 24)};
             uint8_t dlc = (uint8_t)(CAN_RXMDTR0 & 0xFu);
+            color_state_t before = state;
 
-            (void)color_on_frame(&state, dlc, data);
+            if (color_on_frame(&state, dlc, data)) {
+                /* 毎フレーム出すと送信が追いつかないので、色が変わったときと消灯から点いたときだけ出す */
+                if (DEBUG_UART && (before.hold_ms == 0 || before.r != state.r || before.g != state.g ||
+                                   before.b != state.b))
+                    log_color(&state);
+            } else if (DEBUG_UART) {
+                dbglog_puts("rx short dlc=");
+                dbglog_dec(dlc);
+                dbglog_puts("\r\n");
+            }
             CAN_RFIFO0 |= 1u << 5; /* RFOM0 */
         }
         if (TIM2_INTFR & 1u) { /* UIF: 1ms 周期 */
+            uint32_t was_on = state.hold_ms;
+
             TIM2_INTFR = 0xFFFFFFFEu;
             color_tick_1ms(&state);
+            if (DEBUG_UART && was_on && state.hold_ms == 0)
+                dbglog_puts("off timeout\r\n");
         }
         pwm_apply(&state);
+        if (DEBUG_UART) {
+            uint32_t dropped;
+
+            log_can_error(&last_err);
+            dropped = dbglog_take_dropped();
+            if (dropped) {
+                dbglog_puts("log dropped=");
+                dbglog_dec(dropped);
+                dbglog_puts("\r\n");
+            }
+            uart_poll();
+        }
         IWDG_CTLR = 0xAAAAu;
     }
 }
